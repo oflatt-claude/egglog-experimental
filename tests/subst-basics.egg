@@ -5,6 +5,7 @@
 (datatype Math
   (Num i64)
   (Var String)
+  (Wrap Math)
   (Add Math Math)
   (Mul Math Math))
 (sort MathToMath (Map Math Math))
@@ -24,12 +25,14 @@
 (let $x (Var "x"))
 (let $y (Var "y"))
 (let $e (Add $x $y))
-(let $copy (unstable-subst $e (map-insert (map-insert (map-empty) $x $y) $y $x)))
+(let $map (map-insert (map-insert (map-empty) $x $y) $y $x))
+(let $copy (unstable-subst $e $map))
 (check (= $copy (Add $y $x)))
 (pop)
 
-;; Copying an e-class copies all of its e-nodes, so an equation that holds for
-;; every value of the substituted class survives: `x * 0 = 0` stays `5 * 0 = 0`.
+;; Copying an e-class copies all of its e-nodes. This is sound when the
+;; derivation's premises are preserved by substitution: an unconditional
+;; `x * 0 = 0` stays `5 * 0 = 0`.
 (push)
 (rewrite (Mul a (Num 0)) (Num 0))
 (let $x (Var "x"))
@@ -41,17 +44,24 @@
 (check (= $copy (Num 0)))
 (pop)
 
-;; The same mechanism is unsound on a *ground* equation, which holds only for
-;; the class it pins down: `x + 1 = 5` says `x = 4`, so substituting `x := 9`
-;; asserts `9 + 1 = 5`. Only substitute classes that behave like universally
-;; quantified variables.
+;; The same mechanism is unsound when a derivation's premise is not preserved.
+;; `Special x` proves `x * 0 = 0`, but substituting `x := y` also copies that
+;; equation even though `Special y` is false. Callers must establish the
+;; stronger, premise-preservation condition; merely deriving an equation from
+;; a rule is not enough.
 (push)
+(relation Special (Math))
+(rule ((Special a)) ((union (Mul a (Num 0)) (Num 0))))
 (let $x (Var "x"))
-(let $e (Add $x (Num 1)))
-(union $e (Num 5))
-(let $copy (unstable-subst $e (map-insert (map-empty) $x (Num 9))))
-(check (= $copy (Add (Num 9) (Num 1))))
-(check (= $copy (Num 5)))
+(let $y (Var "y"))
+(Special $x)
+(run 1)
+(let $e (Mul $x (Num 0)))
+(check (= $e (Num 0)))
+(fail (check (Special $y)))
+(let $copy (unstable-subst $e (map-insert (map-empty) $x $y)))
+(check (= $copy (Mul $y (Num 0))))
+(check (= $copy (Num 0)))
 (pop)
 
 ;; A key e-class is replaced whole, never walked into, so the other e-nodes in
@@ -74,7 +84,10 @@
 (push)
 (let $x (Var "x"))
 (let $e (Add $x (Num 1)))
-(let $copy (unstable-subst $e (map-insert (map-empty) $x (Mul (Num 2) (Num 3)))))
+(let $copy
+  (unstable-subst
+    $e
+    (map-insert (map-empty) $x (Mul (Num 2) (Num 3)))))
 (check (= $copy (Add (Mul (Num 2) (Num 3)) (Num 1))))
 (pop)
 
@@ -103,8 +116,25 @@
 (check (= $copy (Add $copy (Num 0))))
 (pop)
 
-;; The root's sort is free: it need not be the map's key sort, because a
-;; substitution reaches through every sort in the term structure.
+;; A subsumed row still grounds a cyclic e-class and is copied without becoming
+;; visible to an ordinary rule head. This is the shape reported by Luminal.
+(push)
+(relation saw-wrap (Math))
+(rule ((= e (Wrap x))) ((saw-wrap x)))
+(let $v (Var "v"))
+(let $w (Var "w"))
+(let $a (Wrap $v))
+(union $a (Add $a $v))
+(subsume (Wrap $v))
+(let $sigma (map-insert (map-empty) $v $w))
+(let $img (unstable-subst $a $sigma))
+(run 1)
+(check (= $img (Add $img $w)))
+(fail (check (saw-wrap $w)))
+(pop)
+
+;; The root's sort is independent of the map's key/value sort because the walk
+;; reaches through every sort in the term structure.
 (push)
 (datatype MathList (Nil) (Cons Math MathList))
 (let $x (Var "x"))

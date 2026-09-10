@@ -1,66 +1,26 @@
-//! Substitution over a reachable sub-e-graph: the `unstable-subst` primitive.
+//! Implementation of `(unstable-subst root map)`.
 //!
-//! `(unstable-subst root map)` takes an e-class `root` of any eq-sort and a
-//! `Map` whose key and value sorts are the same eq-sort. It walks the
-//! constructor rows reachable from `root`, copies the part of that sub-e-graph
-//! the substitution actually touches while replacing each key e-class with its
-//! mapped value, and returns the e-class of the copied root.
-//!
-//! The walk follows constructor rows only — `function` rows are analyses over
-//! the term structure, not part of it — and reaches through container-valued
-//! children, rebuilding them with substituted contents.
-//!
-//! Unaffected e-classes are shared with the original rather than copied, so
-//! substituting an empty map returns `root` itself and writes nothing.
-//!
-//! # Warning: `root` must already exist
-//!
-//! Pass a root the rule's query bound, or one from an earlier command — not a
-//! term the enclosing action just built.
-//!
-//! The walk reads committed table contents, and an action's writes stay staged
-//! until it finishes. A root this action built has no rows yet, so the walk
-//! finds no e-nodes under it, nothing is affected, and it comes back
-//! **unchanged and without an error**. `(unstable-subst (Mul x y) m)`, building
-//! its own argument, silently does nothing. The same applies to any term under
-//! the root that the action just built: it is not there to be substituted.
-//!
-//! Replacements are not affected — a map's values are spliced into the copy
-//! without being walked, so those can be built in the same action.
-//!
-//! # Other properties worth knowing
-//!
-//! - The region's equations are substituted along with its terms. Copying an
-//!   e-class copies every one of its e-nodes, so `t1 = t2` in the original
-//!   becomes `σ(t1) = σ(t2)` in the copy — and an e-node with no substituted
-//!   children copies to itself, merging the copy back into the original class.
-//!   That is correct for equations that hold for every value of the substituted
-//!   classes (anything a rewrite rule derived) and wrong for a ground `union`
-//!   pinning one of them down, so only substitute classes that behave like
-//!   universally quantified variables.
-//! - The snapshot comes from live table contents, so this is a `Context::Full`
-//!   primitive: top-level actions and `:naive` rule heads only.
-//!
-//! Copies are named by `lookup_or_insert`, the same way `(Add a b)` in an
-//! action is, so no e-class id is ever invented here. A cyclic e-class can
-//! therefore only be copied if it has an e-node whose children all lie outside
-//! the cycle to name it first — `x = {Var "x", Add x (Num 0)}` does, and works.
-//! A cycle with no such e-node is an error rather than a silent partial copy.
+//! The map's keys and values share one eq-sort and are applied simultaneously
+//! while copying the affected constructor subgraph. The root must have
+//! committed rows when traversal is needed; copied equations are sound only
+//! when substitution preserves their derivations and premises. Subsumed rows
+//! participate without becoming live, and affected cycles need a grounding
+//! row. See `docs/unstable-subst.md` for the complete interface, safety
+//! boundary, algorithm, and cost model.
 
 use std::any::TypeId;
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 
 use egglog::api::RawValues;
 use egglog::ast::Span;
 use egglog::constraint::{self, Constraint, ImpossibleConstraint, TypeConstraint};
 use egglog::sort::MapContainer;
 use egglog::{
-    ArcSort, Atom, AtomTerm, Core, EGraph, Error, FullPrim, FullState, FuncType, Primitive, Read,
-    TypeInfo, Value, Write,
+    ArcSort, Atom, AtomTerm, Core, Error, FullPrim, FullState, FuncType, Primitive, Read, TypeInfo,
+    Value, Write,
 };
 
-/// The name of the primitive, as written in an egglog program.
-pub const SUBST: &str = "unstable-subst";
+const SUBST: &str = "unstable-subst";
 
 /// A constructor the walk can follow.
 type Constructor<'a> = &'a FuncType;
@@ -102,13 +62,14 @@ fn kind_of(sort: &ArcSort) -> Kind {
 struct ENode {
     ctor: usize,
     children: Vec<Value>,
+    subsumed: bool,
 }
 
 /// The reachable sub-e-graph.
 #[derive(Default)]
 struct Snapshot {
-    /// E-nodes of each reachable e-class. Subsumed rows are left out: they are
-    /// excluded from extraction, so a copy must not resurrect them.
+    /// E-nodes of each reachable e-class, including subsumed rows so they can
+    /// participate in structure without being resurrected as live rows.
     nodes: HashMap<Value, Vec<ENode>>,
     /// Contents of each reachable container value, with the [`TypeId`] to
     /// rebuild it under.
@@ -140,6 +101,7 @@ fn constructors<'db>(state: &FullState<'_, 'db>) -> Vec<Constructor<'db>> {
     let names: Vec<String> = state
         .table_sizes()
         .into_iter()
+        .filter(|&(_, size)| size != 0)
         .map(|(name, _)| name.to_owned())
         .collect();
     names
@@ -156,10 +118,11 @@ fn constructors<'db>(state: &FullState<'_, 'db>) -> Vec<Constructor<'db>> {
 /// Substitute `map` through the sub-e-graph reachable from `root`, returning
 /// the root of the copy. See the module docs for the semantics.
 ///
-/// `root` must be an e-class that already has rows: one the query bound, or
-/// one from an earlier command. A root the enclosing action just built is not
-/// in the tables yet and comes back unchanged, with no error.
-pub fn substitute<'db>(
+/// When traversal is needed, `root` must be an e-class that already has rows:
+/// one the query bound, or one from an earlier command. A root the enclosing
+/// action just built is not in the tables yet and comes back unchanged, with
+/// no error. A root that is itself a key returns its mapped value without a walk.
+fn substitute<'db>(
     state: &mut FullState<'_, 'db>,
     root: Value,
     map: &BTreeMap<Value, Value>,
@@ -223,13 +186,12 @@ impl Walk<'_> {
             for index in candidates {
                 let mut rows = Vec::new();
                 state.constructor_enodes_for_eclass(&self.ctors[index].name, value, |enode| {
-                    if !enode.subsumed {
-                        rows.push(enode.children.to_vec());
-                    }
+                    rows.push((enode.children.to_vec(), enode.subsumed));
                 })?;
-                nodes.extend(rows.into_iter().map(|children| ENode {
+                nodes.extend(rows.into_iter().map(|(children, subsumed)| ENode {
                     ctor: index,
                     children,
+                    subsumed,
                 }));
             }
 
@@ -317,16 +279,8 @@ impl Walk<'_> {
         }
     }
 
-    /// Copy the affected e-classes and return the root's image.
-    ///
-    /// Every copied e-node goes in through `lookup_or_insert`, so egglog names
-    /// the copy's e-class — nothing here invents an id. That is why this is a
-    /// sweep rather than a single postorder pass: an e-node can only be copied
-    /// once its children have copies, and a cycle in the copied region needs
-    /// one e-node whose children all lie outside it to get started. A cycle
-    /// with no such e-node is reported instead.
-    /// The e-classes a copy of `node` needs to exist first, direct children and
-    /// container leaves alike.
+    /// The e-classes a copy of `node` needs to resolve first, including leaves
+    /// reached through containers.
     fn node_deps(&self, node: &ENode) -> Vec<Value> {
         let ctor = self.ctors[node.ctor];
         let mut deps = Vec::new();
@@ -357,35 +311,62 @@ impl Walk<'_> {
     ///
     /// Doing this before the first write is what keeps a failure from leaving a
     /// partial copy behind: egglog flushes an action's staged writes even when
-    /// it ends in an error, so a sweep that discovered an ungrounded cycle only
-    /// after copying its way up to it could not take those rows back.
+    /// it ends in an error, so a write pass that discovered an ungrounded cycle
+    /// only after copying its way up to it could not take those rows back.
     fn plan(&self, root: Value) -> Result<Vec<Value>, Error> {
         let region = self.postorder(root);
+        let ranks: HashMap<Value, usize> = region
+            .iter()
+            .enumerate()
+            .map(|(rank, eclass)| (*eclass, rank))
+            .collect();
         let mut copyable: HashSet<Value> = HashSet::new();
         let mut order: Vec<Value> = Vec::with_capacity(region.len());
 
-        // Least fixpoint of "has an e-node whose children all resolve". A class
-        // joins `order` when it becomes nameable, so the order is one the
-        // copies can actually be built in.
-        loop {
-            let mut progress = false;
-            for eclass in &region {
-                if copyable.contains(eclass) {
-                    continue;
-                }
-                let nameable = self.snapshot.nodes[eclass].iter().any(|node| {
-                    self.node_deps(node)
-                        .iter()
-                        .all(|dep| self.resolved(*dep, &copyable))
-                });
-                if nameable {
-                    copyable.insert(*eclass);
-                    order.push(*eclass);
-                    progress = true;
+        // Count each unresolved dependency once per e-node occurrence and
+        // notify just the nodes waiting on a class when its copy becomes
+        // nameable. `(sweep, rank)` preserves the old left-to-right fixpoint's
+        // deterministic allocation order without rescanning the whole region.
+        let mut waiters = vec![Vec::new(); region.len()];
+        let mut owners = Vec::new();
+        let mut pending = Vec::new();
+        for (owner_rank, eclass) in region.iter().enumerate() {
+            for node in &self.snapshot.nodes[eclass] {
+                let node_index = pending.len();
+                owners.push(owner_rank);
+                pending.push(0usize);
+                for dep in self.node_deps(node) {
+                    if self.affected.contains(&dep) && !self.map.contains_key(&dep) {
+                        let dep_rank = ranks[&dep];
+                        pending[node_index] += 1;
+                        waiters[dep_rank].push(node_index);
+                    }
                 }
             }
-            if !progress {
-                break;
+        }
+
+        let mut scheduled = vec![false; region.len()];
+        let mut ready = BTreeSet::new();
+        for (&remaining, &owner_rank) in pending.iter().zip(&owners) {
+            if remaining == 0 && !scheduled[owner_rank] {
+                scheduled[owner_rank] = true;
+                ready.insert((0usize, owner_rank));
+            }
+        }
+        while let Some((sweep, resolved_rank)) = ready.pop_first() {
+            let eclass = region[resolved_rank];
+            copyable.insert(eclass);
+            order.push(eclass);
+            for &node_index in &waiters[resolved_rank] {
+                pending[node_index] -= 1;
+                if pending[node_index] == 0 {
+                    let owner_rank = owners[node_index];
+                    if !scheduled[owner_rank] {
+                        scheduled[owner_rank] = true;
+                        let owner_sweep = sweep + usize::from(owner_rank <= resolved_rank);
+                        ready.insert((owner_sweep, owner_rank));
+                    }
+                }
             }
         }
 
@@ -431,8 +412,7 @@ impl Walk<'_> {
         for eclass in order {
             let mut named = false;
             for node in self.snapshot.nodes.remove(&eclass).unwrap_or_default() {
-                if !named && let Some(args) = self.copied_args(state, &node) {
-                    let copy = state.add(&self.ctors[node.ctor].name, RawValues(args))?;
+                if !named && let Some(copy) = self.copy_node(state, &node)? {
                     self.images.insert(eclass, copy);
                     named = true;
                     continue;
@@ -445,10 +425,9 @@ impl Walk<'_> {
         // Every class has an image now, so the rest go in as further ways to
         // say the class they came from.
         for (eclass, node) in leftovers {
-            let args = self
-                .copied_args(state, &node)
+            let copy = self
+                .copy_node(state, &node)?
                 .expect("plan said every e-node was copyable");
-            let copy = state.add(&self.ctors[node.ctor].name, RawValues(args))?;
             let image = self.images[&eclass];
             if copy != image {
                 state.union(copy, image)?;
@@ -459,6 +438,27 @@ impl Walk<'_> {
             .get(&root)
             .copied()
             .ok_or_else(|| error(format!("the root e-class {root:?} was not copied")))
+    }
+
+    /// Materialize one copied row once all of its inputs have images.
+    /// Subsumption is monotone and therefore wins every collision.
+    fn copy_node(
+        &mut self,
+        state: &mut FullState<'_, '_>,
+        node: &ENode,
+    ) -> Result<Option<Value>, Error> {
+        let Some(args) = self.copied_args(state, node) else {
+            return Ok(None);
+        };
+        let name = &self.ctors[node.ctor].name;
+        let copy = if node.subsumed {
+            let copy = state.add(name, RawValues(args.clone()))?;
+            state.subsume(name, RawValues(args))?;
+            copy
+        } else {
+            state.add(name, RawValues(args))?
+        };
+        Ok(Some(copy))
     }
 
     /// The affected e-classes that need copying, children before parents.
@@ -479,7 +479,10 @@ impl Walk<'_> {
                     }
                     stack.push(Frame::Exit(eclass));
                     for dep in self.snapshot.deps.get(&eclass).into_iter().flatten() {
-                        if self.needs_copy(*dep) && !seen.contains(dep) {
+                        if self.affected.contains(dep)
+                            && !self.map.contains_key(dep)
+                            && !seen.contains(dep)
+                        {
                             stack.push(Frame::Enter(*dep));
                         }
                     }
@@ -488,12 +491,6 @@ impl Walk<'_> {
             }
         }
         order
-    }
-
-    /// Whether this e-class gets a copy: affected, and not a key (a key is
-    /// replaced outright rather than copied).
-    fn needs_copy(&self, eclass: Value) -> bool {
-        self.affected.contains(&eclass) && !self.map.contains_key(&eclass)
     }
 
     /// The substituted children of `node`, or `None` if some child's copy does
@@ -562,8 +559,7 @@ impl Walk<'_> {
             });
             // `collect` already read this value's contents through the same
             // sort, so it is a container of this type.
-            debug_assert!(mapped.is_some(), "{container:?} is not a {type_id:?}");
-            mapped.unwrap_or(container)
+            mapped.expect("collect read this value as the same container type")
         };
         self.container_images.insert(container, image);
         Some(image)
@@ -574,31 +570,14 @@ fn error(message: String) -> Error {
     Error::BackendError(format!("{SUBST}: {message}"))
 }
 
-/// Substitute through the sub-e-graph reachable from `root`, returning the
-/// e-class of the copy. The top-level form of the [`SUBST`] primitive.
+/// The full-context `(unstable-subst root map)` primitive.
 ///
-/// `map` must be a `Map` container value whose key and value sorts are the same
-/// eq-sort; `root` may be of any eq-sort. Constructor rows reachable from
-/// `root` are copied with each key e-class replaced by its mapped value;
-/// e-classes the substitution does not affect are shared with the original
-/// rather than copied.
+/// [`new_experimental_egraph`](crate::new_experimental_egraph) registers it by
+/// default. Callers must ensure that substitution preserves the derivation and
+/// every premise of each copied equation; see the [guide] for the full semantic
+/// safety boundary.
 ///
-/// `root` must be an e-class that already has rows — see the module docs.
-///
-/// Errors if the substituted region contains a cycle in which every e-node
-/// refers back into the cycle, since naming that copy would require an e-class
-/// id no row produces.
-pub fn subst(egraph: &mut EGraph, root: Value, map: Value) -> Result<Value, Error> {
-    egraph.update(|mut state| {
-        let entries = match state.value_to_container::<MapContainer>(map) {
-            Some(entries) => entries.data.clone(),
-            None => return Err(error(format!("{map:?} is not a Map container value"))),
-        };
-        substitute(&mut state, root, &entries)
-    })
-}
-
-/// The `unstable-subst` primitive.
+/// [guide]: https://github.com/egraphs-good/egglog-experimental/blob/main/docs/unstable-subst.md
 #[derive(Clone)]
 pub struct Subst;
 
@@ -613,11 +592,10 @@ impl Primitive for Subst {
 }
 
 impl FullPrim for Subst {
-    /// Returns `None` only for a substitution this cannot perform — today just
-    /// an ungrounded cycle — having first raised a primitive panic, so the
-    /// program stops rather than continuing with a missing value. The shapes
-    /// the typechecker already rules out panic instead, since reaching them
-    /// means a bug here rather than a program egglog should have rejected.
+    /// Returns `None` only after raising a primitive panic, so the program
+    /// stops rather than continuing with a missing value. Shapes the
+    /// typechecker rules out panic directly, since reaching one means a bug
+    /// here rather than a program egglog should have admitted.
     fn apply<'a, 'db>(&self, mut state: FullState<'a, 'db>, args: &[Value]) -> Option<Value> {
         let [root, map] = args else {
             panic!(
