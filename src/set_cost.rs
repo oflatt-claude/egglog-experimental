@@ -14,16 +14,20 @@
 //! Nodes without an assigned dynamic cost retain their normal tree-additive
 //! cost. Costs must be non-negative.
 
-use crate::Error;
+use crate::{
+    Error,
+    greedy_dag_extract::{
+        extract_best_greedy_dag, extract_variants_greedy_dag, split_trailing_extractor,
+    },
+};
 use egglog::{
-    ArcSort, CommandOutput, EGraph, Enode, RawValues, Read, UserDefinedCommand, Value,
+    ArcSort, CommandOutput, EGraph, Enode, RawValues, Read, TermId, UserDefinedCommand, Value,
     ast::*,
     extract::{DEFAULT_COST_MODEL, DagCostModel, DefaultCost, TreeCostModelFromDag},
     span,
     util::FreshGen,
 };
 use egglog_ast::span::Span;
-use log::log_enabled;
 use std::sync::Arc;
 
 /// Registers `with-dynamic-cost`, `set-cost`, and the dynamic-cost `extract`
@@ -245,29 +249,33 @@ impl UserDefinedCommand for CustomExtract {
         egraph: &mut EGraph,
         args: &[Expr],
     ) -> Result<Vec<CommandOutput>, egglog::Error> {
-        match args {
+        let (args, use_greedy_dag) = split_trailing_extractor(args)?;
+        let (expr, variants) = match args {
             [] => {
                 return Err(Error::ParseError(ParseError(
                     span!(),
                     "extract expects an expression and optional variant count".into(),
                 )));
             }
-            [_, _, _, ..] => {
+            [expr] => (expr, None),
+            [expr, variants] => (expr, Some(variants)),
+            [_, _, extra, ..] => {
                 return Err(Error::ParseError(ParseError(
-                    args[2].span(),
-                    "extract expects at most two arguments".into(),
+                    extra.span(),
+                    "extract expects an expression, optional variant count, and optional :extractor"
+                        .into(),
                 )));
             }
-            _ => {}
-        }
-        let (sort, value) = egraph.eval_expr(&args[0])?;
-        let n = args.get(1).map(|arg| egraph.eval_expr(arg)).transpose()?;
+        };
+
+        let (sort, value) = egraph.eval_expr(expr)?;
+        let n = variants.map(|arg| egraph.eval_expr(arg)).transpose()?;
         let n = if let Some(nv) = n {
             // TODO: egglog does not yet support u64
             if nv.0.name() != "i64" {
                 let i64sort = egraph.get_arcsort_by(|s| s.name() == "i64");
                 return Err(egglog::Error::TypeError(egglog::TypeError::Mismatch {
-                    expr: args[1].clone(),
+                    expr: variants.unwrap().clone(),
                     expected: i64sort,
                     actual: nv.0,
                 }));
@@ -279,54 +287,57 @@ impl UserDefinedCommand for CustomExtract {
 
         if n < 0 {
             return Err(Error::ParseError(ParseError(
-                args[1].span(),
+                variants.unwrap().span(),
                 "Cannot extract negative number of variants".into(),
             )));
         }
 
+        let roots = vec![(sort, value)];
+
         // Omitted or zero variant count means best extraction.
         if n == 0 {
-            let mut extracted = egraph.extract_best_with_cost_model(
-                vec![(sort, value)],
-                TreeCostModelFromDag(DynamicCostModel),
-            )?;
-            if let Some(term) = extracted
-                .terms
-                .pop()
-                .expect("one requested root produces one result")
-            {
-                if log_enabled!(log::Level::Info) {
-                    log::info!(
-                        "extracted with cost {}: {}",
-                        term.cost,
-                        extracted.termdag.to_string(term.term)
-                    );
-                }
-                Ok(vec![CommandOutput::ExtractBest(
-                    extracted.termdag,
-                    term.cost,
-                    term.term,
-                )])
+            let extracted = if use_greedy_dag {
+                extract_best_greedy_dag(egraph, roots, DynamicCostModel)?
             } else {
-                Err(Error::ExtractError(
-                    "Unable to find any valid extraction (likely due to subsume or delete)"
-                        .to_string(),
-                ))
-            }
-        } else {
-            let mut extracted = egraph.extract_variants_with_cost_model(
-                vec![(sort, value)],
-                n as usize,
-                TreeCostModelFromDag(DynamicCostModel),
-            )?;
-            let terms = extracted
-                .variants
-                .pop()
-                .expect("one requested root produces one variant list")
+                egraph
+                    .extract_best_with_cost_model(roots, TreeCostModelFromDag(DynamicCostModel))?
+            };
+            let root = extracted
+                .terms
                 .into_iter()
-                .map(|term| term.term)
+                .next()
+                .expect("one root was requested")
+                .ok_or_else(|| {
+                    Error::ExtractError("Unable to find any valid extraction".to_string())
+                })?;
+            log::info!(
+                "extracted with cost {}: {}",
+                root.cost,
+                extracted.termdag.to_string(root.term)
+            );
+            Ok(vec![CommandOutput::ExtractBest(
+                extracted.termdag,
+                root.cost,
+                root.term,
+            )])
+        } else {
+            let extracted = if use_greedy_dag {
+                extract_variants_greedy_dag(egraph, roots, n as usize, DynamicCostModel)?
+            } else {
+                egraph.extract_variants_with_cost_model(
+                    roots,
+                    n as usize,
+                    TreeCostModelFromDag(DynamicCostModel),
+                )?
+            };
+            let terms: Vec<TermId> = extracted
+                .variants
+                .into_iter()
+                .next()
+                .expect("one root was requested")
+                .into_iter()
+                .map(|variant| variant.term)
                 .collect();
-            log::info!("extracted variants:");
             Ok(vec![CommandOutput::ExtractVariants(
                 extracted.termdag,
                 terms,

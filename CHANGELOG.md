@@ -6,11 +6,30 @@ This file records notable user-facing changes to egglog-experimental.
 
 ### Added
 
+- A `:node-limit N` option for the `back-off` scheduler: once an observed count
+  reaches this soft threshold, further rules are delayed. Each check sees
+  earlier rule actions, but one rule may add any number of nodes and the
+  deferred rebuild may change the count again.
+- The `(get-node-size!)` primitive: the visible e-node count of an
+  ordinary experimental e-graph, excluding relations, analysis functions,
+  global aliases, hidden declarations, and internal-prefixed implementation
+  tables. This is the same measure `:node-limit` uses there.
+- A `:dag` option for `multi-extract` that let-binds subterms shared across
+  the extracted variants instead of expanding every variant to a tree.
+- Greedy DAG extraction for `extract`, `multi-extract`, and `keep-best` via
+  `:extractor greedy-dag`.
 - `(unstable-subst root map)`, which copies the affected portion of the
   constructor sub-e-graph reachable from `root` with each key e-class replaced
   by its mapped value, preserving subsumed rows and making subsumption dominant
   on copy collisions. Available in top-level actions and `:naive` rule heads;
   anchorless affected cycles fail before copy writes.
+
+### Changed
+
+- The `back-off` scheduler now rejects unknown option tags instead of silently
+  ignoring misspellings or removed options.
+- `keep-best` now honors dynamic costs assigned by `set-cost` in both tree and
+  greedy-DAG extraction modes.
 
 ## [3.0.0] - 2026-08-20
 
