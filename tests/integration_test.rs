@@ -2245,3 +2245,33 @@ fn test_greedy_dag_reconstruction_handles_deep_constructor_chains() {
     let stderr = String::from_utf8(output.stderr).unwrap();
     assert!(output.status.success(), "unexpected status: {stderr}");
 }
+
+#[test]
+fn test_named_args_do_not_leak_between_cloned_egraphs() {
+    // Field names belong to one e-graph. Cloning an e-graph and then declaring
+    // the same name with a different field order in each must not let one
+    // declaration rewrite the other's calls, which would silently insert a row
+    // with its arguments transposed.
+    let mut first = egglog_experimental::new_experimental_egraph();
+    let mut second = first.clone();
+
+    // Both declarations land before either call, so a shared registry would
+    // have the second one's field order in place when the first graph runs.
+    first
+        .parse_and_run_program(None, "(relation R (:a i64 :b i64))")
+        .unwrap();
+    second
+        .parse_and_run_program(None, "(relation R (:b i64 :a i64))")
+        .unwrap();
+
+    first.parse_and_run_program(None, "(R :a 1 :b 2)").unwrap();
+    second.parse_and_run_program(None, "(R :a 1 :b 2)").unwrap();
+
+    // `:a` is the first field in `first` and the second in `second`.
+    first
+        .parse_and_run_program(None, "(check (R 1 2))")
+        .unwrap();
+    second
+        .parse_and_run_program(None, "(check (R 2 1))")
+        .unwrap();
+}

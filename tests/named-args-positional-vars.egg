@@ -1,0 +1,16 @@
+; A table declared without field names must keep accepting ordinary variables,
+; including ones that happen to start with `:`. Only declarations that named
+; their fields may interpret `:name` and `...` as markers.
+
+(relation R (i64))
+(let :value 1)
+(R :value)
+(run 0)
+(check (R 1))
+
+; `...` likewise stays an ordinary variable for a positional declaration.
+(relation S (i64))
+(let ... 2)
+(S ...)
+(run 0)
+(check (S 2))

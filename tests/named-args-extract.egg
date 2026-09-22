@@ -1,0 +1,10 @@
+; Named calls must expand inside user-defined command arguments too, such as
+; this crate's `extract`, `multi-extract`, and `run-schedule`.
+
+(datatype T (C :x i64))
+(extract (C :x 1))
+
+(relation Seen (T))
+(rule ((C :x x)) ((Seen (C :x x))))
+(run 1)
+(check (Seen (C 1)))
