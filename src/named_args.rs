@@ -40,9 +40,9 @@
 //! Two details make source order match declaration scope, which is what the
 //! parser has to rely on:
 //!
-//! * `(include ...)` is expanded here rather than left for egglog to read after
-//!   parsing, so an included declaration is registered before the calls that
-//!   follow it are parsed.
+//! * `(include ...)` is read once here, so an included declaration registers its
+//!   field names before the calls that follow it are parsed. The command is
+//!   still passed through for egglog to read and run as usual.
 //! * A positional declaration registers [`PositionalCall`], which shadows any
 //!   field names registered for that name earlier. egglog rejects redeclaring a
 //!   bound name, so the only way one name is declared twice is
@@ -250,11 +250,18 @@ impl Macro<Expr> for PositionalCall {
     }
 }
 
-/// `(include <file>)`, expanded while parsing.
+/// `(include <file>)`, read once while parsing so that the declarations inside
+/// register their field names.
 ///
-/// egglog otherwise keeps `Command::Include` and reads the file after the whole
-/// program has been parsed, which is too late for a declaration in that file to
-/// be registered before the calls that follow the include are parsed.
+/// The command itself is passed through untouched, so egglog still reads and
+/// runs the file the way it always has. This only brings the *registration*
+/// forward: egglog reads an include while running, by which point the calls
+/// that follow it in the same program have long since been parsed, and a named
+/// call to something the include declares would have nothing to expand against.
+///
+/// Reading here is best-effort and never reports. A file that is missing, or
+/// that does not parse, is left for egglog to fail on from its own include
+/// handling, so this can only ever add registrations.
 struct Include;
 
 impl Macro<Vec<Command>> for Include {
@@ -272,9 +279,12 @@ impl Macro<Vec<Command>> for Include {
             return error(span, "usage: (include <file name>)");
         };
         let file = file.expect_string("file name")?;
-        let contents = std::fs::read_to_string(&file)
-            .map_err(|e| ParseError(span.clone(), format!("could not read {file}: {e}")))?;
-        parser.get_program_from_string(Some(file), &contents)
+        if let Ok(contents) = std::fs::read_to_string(&file) {
+            // The commands are discarded; only the parser state this leaves
+            // behind, the registered field names, is wanted.
+            let _ = parser.get_program_from_string(Some(file.clone()), &contents);
+        }
+        Ok(vec![Command::Include(span, file)])
     }
 }
 
