@@ -38,7 +38,7 @@ impl BaseSort for RationalSort {
     }
 
     #[rustfmt::skip]
-    fn register_primitives(&self, eg: &mut EGraph) {
+    fn register_primitives(&self, eg: &mut egglog::TypeInfo) {
         add_primitive!(eg, "+" = |a: R, b: R| -?> R { a.0.checked_add(&b.0).map(R::new) });
         add_primitive!(eg, "-" = |a: R, b: R| -?> R { a.0.checked_sub(&b.0).map(R::new) });
         add_primitive!(eg, "*" = |a: R, b: R| -?> R { a.0.checked_mul(&b.0).map(R::new) });

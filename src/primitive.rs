@@ -2,85 +2,46 @@ use egglog::ast::{Expr, FunctionSubtype, Literal};
 use egglog::constraint::SimpleTypeConstraint;
 use egglog::prelude::Span;
 use egglog::sort::FunctionSort;
+use egglog::util::SymbolGen;
 use egglog::{
     ArcSort, CommandOutput, Context, Core, EGraph, Error, FullPrim, FullState, Primitive, PurePrim,
-    PureState, ReadPrim, ReadState, ResolvedCall, ResolvedExpr, TypeError, UserDefinedCommand,
-    Value, WritePrim, WriteState,
+    PureState, ReadPrim, ReadState, ResolvedCall, ResolvedExpr, TypeError, TypeInfo,
+    UserDefinedCommand, Value, WritePrim, WriteState,
 };
 use std::sync::Arc;
 
 pub(crate) struct RegisterPrimitive;
 
 impl UserDefinedCommand for RegisterPrimitive {
+    fn declare(
+        &self,
+        types: &mut TypeInfo,
+        symbols: &mut SymbolGen,
+        args: &[Expr],
+    ) -> Result<(), Error> {
+        if let Some(name) = args.first() {
+            let (span, name) = decode_atom(name, "primitive name")?;
+            ensure_name_available(types, &name, &span)?;
+        }
+        let (primitive, context) = prepare(types, symbols, args)?;
+        let contexts: &[Context] = match context {
+            Context::Pure => &[Context::Pure, Context::Read, Context::Write, Context::Full],
+            Context::Read => &[Context::Read, Context::Full],
+            Context::Write => &[Context::Write, Context::Full],
+            Context::Full => &[Context::Full],
+        };
+        types.declare_primitive(primitive, contexts);
+        Ok(())
+    }
+
     fn update(&self, egraph: &mut EGraph, args: &[Expr]) -> Result<Vec<CommandOutput>, Error> {
-        if args.len() != 4 {
-            return Err(backend_error(
-                args.first().map(Expr::span).unwrap_or_else(|| Span::Panic),
-                format!("primitive expects 4 arguments, got {}", args.len()),
-            ));
-        }
-
-        let (name_span, name) = decode_atom(&args[0], "primitive name")?;
-        ensure_name_available(egraph, &name, &name_span)?;
-
-        let input_sort_names = decode_input_sort_names(&args[1])?;
-        let input_var_names: Vec<_> = (0..input_sort_names.len())
-            .map(|index| format!("_{index}"))
-            .collect();
-
-        let input_sorts = input_sort_names
-            .iter()
-            .map(|(span, sort_name)| resolve_sort(egraph, sort_name, span))
-            .collect::<Result<Vec<_>, _>>()?;
-        let (output_span, output_name) = decode_atom(&args[2], "output sort")?;
-        let output_sort = resolve_sort(egraph, &output_name, &output_span)?;
-
-        let bindings: Vec<_> = input_var_names
-            .iter()
-            .zip(&input_sorts)
-            .map(|(name, sort)| (name.clone(), args[3].span(), sort.clone()))
-            .collect();
-
-        let mut last_error = None;
-        let mut typechecked_body = None;
-        for context in [Context::Pure, Context::Read, Context::Write, Context::Full] {
-            match egraph.typecheck_expr_with_bindings_and_output(
-                &args[3],
-                &bindings,
-                output_sort.clone(),
-                context,
-            ) {
-                Ok(resolved)
-                    if matches!(
-                        (required_context(egraph, &resolved), context),
-                        (Context::Pure, _)
-                            | (Context::Read, Context::Read | Context::Full)
-                            | (Context::Write, Context::Write | Context::Full)
-                            | (Context::Full, Context::Full)
-                    ) =>
-                {
-                    typechecked_body = Some((resolved, context));
-                    break;
-                }
-                Ok(_) => {}
-                Err(err) => last_error = Some(err),
-            }
-        }
-        let Some((body, context)) = typechecked_body else {
-            return Err(last_error
-                .expect("primitive body typechecking always tries at least one context")
-                .into());
-        };
-
+        let mut symbols = egraph.parser.symbol_gen.clone();
+        let (mut primitive, context) = prepare(egraph.type_info(), &mut symbols, args)?;
+        egraph.parser.symbol_gen = symbols;
+        let body = egraph.install_resolved_expr(primitive.body);
         let (body, hidden_bindings) = egraph.prepare_unstable_fn_targets_for_eval(&body)?;
-        let primitive = DefinedPrimitive {
-            name,
-            input_vars: input_var_names,
-            input: input_sorts,
-            output: output_sort,
-            body,
-            hidden_bindings,
-        };
+        primitive.body = body;
+        primitive.hidden_bindings = hidden_bindings;
         match context {
             Context::Pure => egraph.add_pure_primitive(primitive, None),
             Context::Read => egraph.add_read_primitive(primitive, None),
@@ -89,6 +50,83 @@ impl UserDefinedCommand for RegisterPrimitive {
         }
         Ok(vec![])
     }
+}
+
+fn prepare(
+    types: &TypeInfo,
+    symbols: &mut SymbolGen,
+    args: &[Expr],
+) -> Result<(DefinedPrimitive, Context), Error> {
+    if args.len() != 4 {
+        return Err(backend_error(
+            args.first().map(Expr::span).unwrap_or_else(|| Span::Panic),
+            format!("primitive expects 4 arguments, got {}", args.len()),
+        ));
+    }
+
+    let (_name_span, name) = decode_atom(&args[0], "primitive name")?;
+
+    let input_sort_names = decode_input_sort_names(&args[1])?;
+    let input_var_names: Vec<_> = (0..input_sort_names.len())
+        .map(|index| format!("_{index}"))
+        .collect();
+
+    let input_sorts = input_sort_names
+        .iter()
+        .map(|(span, sort_name)| resolve_sort(types, sort_name, span))
+        .collect::<Result<Vec<_>, _>>()?;
+    let (output_span, output_name) = decode_atom(&args[2], "output sort")?;
+    let output_sort = resolve_sort(types, &output_name, &output_span)?;
+
+    let bindings: Vec<_> = input_var_names
+        .iter()
+        .zip(&input_sorts)
+        .map(|(name, sort)| (name.clone(), args[3].span(), sort.clone()))
+        .collect();
+
+    let mut last_error = None;
+    let mut typechecked_body = None;
+    for context in [Context::Pure, Context::Read, Context::Write, Context::Full] {
+        match types.typecheck_expr_with_bindings_and_output(
+            symbols,
+            &args[3],
+            &bindings,
+            output_sort.clone(),
+            context,
+        ) {
+            Ok(resolved)
+                if matches!(
+                    (required_context(types, &resolved), context),
+                    (Context::Pure, _)
+                        | (Context::Read, Context::Read | Context::Full)
+                        | (Context::Write, Context::Write | Context::Full)
+                        | (Context::Full, Context::Full)
+                ) =>
+            {
+                typechecked_body = Some((resolved, context));
+                break;
+            }
+            Ok(_) => {}
+            Err(err) => last_error = Some(err),
+        }
+    }
+    let Some((body, context)) = typechecked_body else {
+        return Err(last_error
+            .expect("primitive body typechecking always tries at least one context")
+            .into());
+    };
+
+    Ok((
+        DefinedPrimitive {
+            name,
+            input_vars: input_var_names,
+            input: input_sorts,
+            output: output_sort,
+            body,
+            hidden_bindings: vec![],
+        },
+        context,
+    ))
 }
 
 #[derive(Clone)]
@@ -194,27 +232,27 @@ fn decode_input_sort_names(expr: &Expr) -> Result<Vec<(Span, String)>, Error> {
     }
 }
 
-fn ensure_name_available(egraph: &mut EGraph, name: &str, span: &Span) -> Result<(), Error> {
-    if egraph.get_sort_by_name(name).is_some() {
+fn ensure_name_available(types: &TypeInfo, name: &str, span: &Span) -> Result<(), Error> {
+    if types.get_sort_by_name(name).is_some() {
         return Err(TypeError::SortAlreadyBound(name.to_owned(), span.clone()).into());
     }
-    if egraph.type_info().get_func_type(name).is_some() {
+    if types.get_func_type(name).is_some() {
         return Err(TypeError::FunctionAlreadyBound(name.to_owned(), span.clone()).into());
     }
-    if egraph.type_info().get_prims(name).is_some() {
+    if types.get_prims(name).is_some() {
         return Err(TypeError::PrimitiveAlreadyBound(name.to_owned(), span.clone()).into());
     }
     Ok(())
 }
 
-fn resolve_sort(egraph: &EGraph, name: &str, span: &Span) -> Result<ArcSort, Error> {
-    egraph
+fn resolve_sort(types: &TypeInfo, name: &str, span: &Span) -> Result<ArcSort, Error> {
+    types
         .get_sort_by_name(name)
         .cloned()
         .ok_or_else(|| TypeError::UndefinedSort(name.to_owned(), span.clone()).into())
 }
 
-fn required_context(egraph: &mut EGraph, expr: &ResolvedExpr) -> Context {
+fn required_context(types: &TypeInfo, expr: &ResolvedExpr) -> Context {
     match expr {
         ResolvedExpr::Lit(_, _) | ResolvedExpr::Var(_, _) => Context::Pure,
         ResolvedExpr::Call(_, resolved_call, children) => {
@@ -222,7 +260,7 @@ fn required_context(egraph: &mut EGraph, expr: &ResolvedExpr) -> Context {
                 ResolvedCall::Primitive(primitive) if primitive.name() == "unstable-fn" => {
                     match children.first() {
                         Some(ResolvedExpr::Lit(_, Literal::String(name))) => {
-                            let type_info = egraph.type_info();
+                            let type_info = types;
                             if let Some(func) = type_info.get_func_type(name) {
                                 match func.subtype {
                                     FunctionSubtype::Constructor => Context::Write,
@@ -270,7 +308,7 @@ fn required_context(egraph: &mut EGraph, expr: &ResolvedExpr) -> Context {
             };
             let mut context = call_context;
             for child in children {
-                context = match (context, required_context(egraph, child)) {
+                context = match (context, required_context(types, child)) {
                     (Context::Full, _) | (_, Context::Full) => Context::Full,
                     (Context::Read, Context::Write) | (Context::Write, Context::Read) => {
                         Context::Full

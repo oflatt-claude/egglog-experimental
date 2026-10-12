@@ -27,8 +27,8 @@
 //! - `(primitive name (InputSort...) OutputSort body)` defines a primitive in
 //!   egglog. Body arguments are named `_0`, `_1`, and so on; calls to existing
 //!   primitives, functions, and globals determine the required access mode.
-//! - `(unstable-fresh! Sort [:cost N] [:unextractable])` creates a fresh value
-//!   for each match of a rule action.
+//! - `(unstable-fresh! [Sort] [:cost N] [:unextractable])` creates a fresh value
+//!   for each match of a rule action; its equality sort can be inferred from uses.
 //! - [`Subst`] implements `(unstable-subst root map)`, which copies the affected
 //!   portion of the constructor sub-e-graph reachable from `root` with each key
 //!   e-class replaced by its mapped value.
@@ -77,7 +77,7 @@
 //! - [`KeepBestCommand`] compacts selected tables to their best terms.
 //! - [`effsafe_extract`] adds `(extract term :extractor effsafe)` and
 //!   `(print-function Ctor :extractor effsafe)`: effect-safe extraction for languages
-//!   that thread a state through their terms. `(set-effectful Sort e)` marks the
+//!   that thread a state through their terms. `(set-effectful e)` marks the
 //!   effectful e-classes and `:regions` annotations on constructors mark
 //!   subregions (see `docs/effsafe-extract.md`).
 //! - `:extractor greedy-dag` enables heuristic DAG-cost extraction for
@@ -147,7 +147,7 @@ pub fn new_experimental_egraph() -> EGraph {
     let mut egraph = EGraph::default();
 
     // Set up the parser with experimental parse-time macros
-    egraph.parser = experimental_parser();
+    register_syntax_macros(&mut egraph.parser);
 
     // Rational support
     add_base_sort(&mut egraph, RationalSort, span!()).unwrap();
@@ -158,9 +158,11 @@ pub fn new_experimental_egraph() -> EGraph {
     egraph.add_read_primitive(GetNodeSizePrimitive, None);
 
     // unstable-fresh! macro
-    egraph
-        .command_macros_mut()
-        .register(Arc::new(fresh_macro::FreshMacro::new()));
+    egraph.parser.macros().register(
+        macros::Space::Expr,
+        "unstable-fresh!",
+        Arc::new(fresh_macro::FreshMacro),
+    );
 
     // scheduler support
     egraph
@@ -205,7 +207,17 @@ pub fn new_experimental_egraph() -> EGraph {
 /// Use [`new_experimental_egraph`] to register all runtime extensions as well.
 pub fn experimental_parser() -> Parser {
     let mut parser = Parser::default();
-    parser.add_command_macro(Arc::new(sugar::For));
-    parser.add_command_macro(Arc::new(sugar::WithRuleset));
+    register_syntax_macros(&mut parser);
     parser
+}
+
+fn register_syntax_macros(parser: &mut Parser) {
+    parser
+        .macros()
+        .register(macros::Space::Command, "for", Arc::new(sugar::For));
+    parser.macros().register(
+        macros::Space::Command,
+        "with-ruleset",
+        Arc::new(sugar::WithRuleset),
+    );
 }

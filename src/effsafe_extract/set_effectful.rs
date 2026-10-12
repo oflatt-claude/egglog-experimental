@@ -1,16 +1,14 @@
-//! `(set-effectful Sort e)`: mark the e-class of `e` as effectful.
-//!
-//! `Sort` must be an existing eq sort, and `e` must have that sort. Marks may
-//! appear at top level or in rule heads. The per-sort relation is declared on
-//! first use; no separate declaration is needed.
+//! `(set-effectful e)` marks an inferred equality-sort value. The explicit
+//! `(set-effectful Sort e)` annotation is useful when the rule is ambiguous.
 
-use egglog::ast::{Action, Command, Expr, ParseError};
-use egglog::util::SymbolGen;
-use egglog::{CommandMacro, Error, TypeInfo};
+use egglog::ast::{Command, ParseError, ResolvedAction, ResolvedActions, ResolvedExprExt};
+use egglog::macros::{
+    Completion, Deferred, Expansion, Macro, MacroContext, SortConstraint, Syntax,
+};
+use std::sync::Arc;
 
 /// The macro's name in programs.
 pub const SET_EFFECTFUL: &str = "set-effectful";
-
 const RELATION_PREFIX: &str = "effsafe_effectful_";
 
 /// The generated relation holding the effectful e-classes of `sort`.
@@ -18,83 +16,61 @@ pub fn effectful_relation(sort: &str) -> String {
     format!("{RELATION_PREFIX}{sort}")
 }
 
-/// The sort whose effectful e-classes `relation` holds, if it is one of ours.
+/// Recover the equality sort associated with a generated mark relation.
 pub fn effectful_relation_sort(relation: &str) -> Option<&str> {
     relation.strip_prefix(RELATION_PREFIX)
 }
 
-/// Rewrite `set-effectful` actions and declare their per-sort relations.
+/// Mark an effectful value after the enclosing inference region has been solved.
 pub struct SetEffectful;
-
-impl CommandMacro for SetEffectful {
-    fn transform(
-        &self,
-        mut command: Command,
-        _symbol_gen: &mut SymbolGen,
-        type_info: &TypeInfo,
-    ) -> Result<Vec<Command>, Error> {
-        let mut declarations = Vec::new();
-        match &mut command {
-            Command::Rule { rule } => {
-                for action in &mut rule.head.0 {
-                    rewrite_action(action, type_info, &mut declarations)?;
+impl Macro for SetEffectful {
+    fn expand(&self, input: &Syntax, cx: &mut MacroContext<'_>) -> Result<Expansion, ParseError> {
+        let (_, args, span) = input.expect_call("set-effectful")?;
+        let mut constraints = vec![SortConstraint::EqSort(0)];
+        let expr = match args {
+            [expr] => expr,
+            [sort, expr] => {
+                let name = sort.expect_atom("sort annotation")?;
+                let sort = cx
+                    .types()?
+                    .get_sort_by_name(&name)
+                    .ok_or_else(|| ParseError(sort.span(), format!("unknown sort {name}")))?
+                    .clone();
+                if !sort.is_eq_sort() {
+                    return Err(ParseError(
+                        span.clone(),
+                        format!("{name} is not an eq sort"),
+                    ));
                 }
+                constraints.push(SortConstraint::Is(0, sort));
+                expr
             }
-            Command::Action(action) => rewrite_action(action, type_info, &mut declarations)?,
-            _ => {}
-        }
-        declarations.push(command);
-        Ok(declarations)
+            _ => {
+                return Err(ParseError(
+                    span,
+                    "usage: (set-effectful [Sort] expr)".into(),
+                ));
+            }
+        };
+        let operand = cx.parser().parse_expr(expr)?;
+        Ok(Expansion::Deferred(Deferred {
+            operands: vec![operand],
+            constraints,
+            finish: Arc::new(move |cx, operands, _| {
+                let sort = operands[0].output_type();
+                let relation = effectful_relation(sort.name());
+                if cx.types().get_func_type(&relation).is_none() {
+                    cx.declare(Command::Relation {
+                        span: span.clone(),
+                        name: relation.clone(),
+                        inputs: vec![sort.name().to_owned()],
+                    })?;
+                }
+                let call = cx.call(&relation, operands.to_vec())?;
+                Ok(Completion::Actions(ResolvedActions::new(vec![
+                    ResolvedAction::Expr(span.clone(), call),
+                ])))
+            }),
+        }))
     }
-}
-
-fn rewrite_action(
-    action: &mut Action,
-    type_info: &TypeInfo,
-    declarations: &mut Vec<Command>,
-) -> Result<(), Error> {
-    let Action::Expr(_, Expr::Call(span, name, args)) = action else {
-        return Ok(());
-    };
-    if name != SET_EFFECTFUL {
-        return Ok(());
-    }
-    let [Expr::Var(sort_span, sort), expr] = args.as_slice() else {
-        return Err(Error::ParseError(ParseError(
-            span.clone(),
-            "usage: (set-effectful <Sort> <expr>) where <Sort> is an eq sort".to_string(),
-        )));
-    };
-    match type_info.get_sort_by_name(sort) {
-        Some(s) if s.is_eq_sort() => {}
-        Some(_) => {
-            return Err(Error::ParseError(ParseError(
-                sort_span.clone(),
-                format!("set-effectful: {sort} is not an eq sort"),
-            )));
-        }
-        None => {
-            return Err(Error::ParseError(ParseError(
-                sort_span.clone(),
-                format!("set-effectful: unknown sort {sort}"),
-            )));
-        }
-    }
-
-    let relation = effectful_relation(sort);
-    if type_info.get_func_type(&relation).is_none()
-        && !declarations
-            .iter()
-            .any(|command| matches!(command, Command::Relation { name, .. } if name == &relation))
-    {
-        declarations.push(Command::Relation {
-            span: span.clone(),
-            name: relation.clone(),
-            inputs: vec![sort.clone()],
-        });
-    }
-    let expr = expr.clone();
-    *name = relation;
-    *args = vec![expr];
-    Ok(())
 }

@@ -116,7 +116,7 @@ impl ContainerSort for MaybeSort {
             .collect()
     }
 
-    fn register_primitives(&self, egraph: &mut EGraph) {
+    fn register_primitives(&self, egraph: &mut egglog::TypeInfo) {
         let maybe = self.clone().to_arcsort();
 
         add_primitive!(egraph, "maybe-some" = {self.clone(): MaybeSort} |value: # (self.element.clone())| -> @MaybeContainer (maybe) {

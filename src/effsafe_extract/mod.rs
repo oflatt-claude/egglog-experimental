@@ -1,6 +1,6 @@
 //! Effect-safe extraction for languages that thread an explicit state.
 //!
-//! Mark state-carrying e-classes with `(set-effectful Sort e)` and subregion
+//! Mark state-carrying e-classes with `(set-effectful e)` and subregion
 //! arguments with `:regions`, then use `(extract e :extractor effsafe)` or
 //! `(print-function Ctor :extractor effsafe)`. Pure terms are extracted from
 //! the state chain chosen for their region.
@@ -24,8 +24,9 @@ use std::collections::HashMap;
 use std::fmt::{Debug, Display, Formatter, Result as FmtResult};
 use std::sync::Arc;
 
-use egglog::ast::{Command, Expr, Literal, Macro, ParseError, Parser, PrintFunctionMode, Sexp};
+use egglog::ast::{Command, Expr, Literal, ParseError, PrintFunctionMode, Sexp};
 use egglog::extract::{DagCostModel, TreeCostModel, TreeCostModelFromDag};
+use egglog::macros::{Expansion, Fragment, Macro, MacroBinding, MacroContext, Space, Syntax};
 use egglog::{CommandOutput, EGraph, Error, TermDag, TermId, UserDefinedCommand, span};
 use egglog_ast::span::Span;
 use rustc_hash::FxHashMap;
@@ -425,16 +426,7 @@ impl UserDefinedCommand for PrintFunction {
 
 /// Add `:regions (<position>...)` to constructor and datatype declarations.
 struct RegionsAnnotation {
-    head: &'static str,
-}
-
-// `Sexp` does not implement `Clone`.
-fn clone_sexp(sexp: &Sexp) -> Sexp {
-    match sexp {
-        Sexp::Literal(lit, span) => Sexp::Literal(lit.clone(), span.clone()),
-        Sexp::Atom(atom, span) => Sexp::Atom(atom.clone(), span.clone()),
-        Sexp::List(items, span) => Sexp::List(items.iter().map(clone_sexp).collect(), span.clone()),
-    }
+    core: MacroBinding,
 }
 
 /// Remove `:regions (...)` from a declaration's option list. Returns the
@@ -444,7 +436,7 @@ fn strip_regions(items: &[Sexp]) -> Result<(Vec<Sexp>, Option<Vec<i64>>), ParseE
         .iter()
         .position(|s| matches!(s, Sexp::Atom(a, _) if a == ":regions"))
     else {
-        return Ok((items.iter().map(clone_sexp).collect(), None));
+        return Ok((items.to_vec(), None));
     };
     let Some(Sexp::List(positions, _)) = items.get(i + 1) else {
         return Err(ParseError(
@@ -462,8 +454,8 @@ fn strip_regions(items: &[Sexp]) -> Result<(Vec<Sexp>, Option<Vec<i64>>), ParseE
             )),
         })
         .collect::<Result<Vec<_>, _>>()?;
-    let mut rest: Vec<Sexp> = items[..i].iter().map(clone_sexp).collect();
-    rest.extend(items[i + 2..].iter().map(clone_sexp));
+    let mut rest: Vec<Sexp> = items[..i].to_vec();
+    rest.extend(items[i + 2..].iter().cloned());
     Ok((rest, Some(positions)))
 }
 
@@ -477,76 +469,20 @@ fn regions_command(span: Span, constructor: &str, positions: &[i64]) -> Command 
     Command::UserDefined(span, "effsafe-regions".to_string(), args)
 }
 
-/// Strip `:regions` from the variant lists in `items[skip..]`, collecting an
-/// `effsafe-regions` command for each annotated variant.
-fn strip_variants(
-    items: &[Sexp],
-    skip: usize,
-    region_commands: &mut Vec<Command>,
-) -> Result<Vec<Sexp>, ParseError> {
-    let mut rest = Vec::with_capacity(items.len());
-    for (i, item) in items.iter().enumerate() {
-        match item {
-            Sexp::List(variant, vspan) if i >= skip => {
-                let (stripped, positions) = strip_regions(variant)?;
-                if let (Some(positions), Some(Sexp::Atom(name, _))) = (positions, variant.first()) {
-                    region_commands.push(regions_command(vspan.clone(), name, &positions));
-                }
-                rest.push(Sexp::List(stripped, vspan.clone()));
-            }
-            other => rest.push(clone_sexp(other)),
-        }
-    }
-    Ok(rest)
-}
-
-impl Macro<Vec<Command>> for RegionsAnnotation {
-    fn name(&self) -> &str {
-        self.head
-    }
-
-    fn parse(
-        &self,
-        args: &[Sexp],
-        span: Span,
-        _parser: &mut Parser,
-    ) -> Result<Vec<Command>, ParseError> {
-        let mut region_commands = Vec::new();
-        let stripped: Vec<Sexp> = match self.head {
-            "constructor" => {
-                let (rest, positions) = strip_regions(args)?;
-                if let (Some(positions), Some(Sexp::Atom(name, _))) = (positions, args.first()) {
-                    region_commands.push(regions_command(span.clone(), name, &positions));
-                }
-                rest
-            }
-            "datatype" => {
-                // (datatype Name (Variant Sort... :regions (...))...)
-                strip_variants(args, 1, &mut region_commands)?
-            }
-            _ => {
-                // (datatype* (Name (Variant ...)...) (sort Name (Container ...))...)
-                let mut rest = Vec::with_capacity(args.len());
-                for arg in args {
-                    match arg {
-                        Sexp::List(items, dspan) if !matches!(items.first(), Some(Sexp::Atom(head, _)) if head == "sort") =>
-                        {
-                            let items = strip_variants(items, 1, &mut region_commands)?;
-                            rest.push(Sexp::List(items, dspan.clone()));
-                        }
-                        other => rest.push(clone_sexp(other)),
-                    }
-                }
-                rest
-            }
-        };
-        // Parse the plain declaration with a macro-free parser, so this macro
-        // does not recurse into itself.
-        let mut items = vec![Sexp::Atom(self.head.to_string(), span.clone())];
+impl Macro for RegionsAnnotation {
+    fn expand(&self, input: &Syntax, _cx: &mut MacroContext<'_>) -> Result<Expansion, ParseError> {
+        let (_, args, span) = input.expect_call("constructor")?;
+        let (stripped, positions) = strip_regions(args)?;
+        let mut items = vec![Sexp::Atom("constructor".into(), span.clone())];
         items.extend(stripped);
-        let mut commands = Parser::default().parse_command(&Sexp::List(items, span))?;
-        commands.extend(region_commands);
-        Ok(commands)
+        let mut result = vec![self.core.bind(Sexp::List(items, span.clone()))];
+        if let (Some(positions), Some(Sexp::Atom(name, _))) = (positions, args.first()) {
+            result.push(
+                Fragment::Commands(vec![regions_command(span.clone(), name, &positions)])
+                    .syntax(span),
+            );
+        }
+        Ok(Expansion::Sequence(result))
     }
 }
 
@@ -557,15 +493,12 @@ impl Macro<Vec<Command>> for RegionsAnnotation {
 /// [`crate::new_experimental_egraph`] registers both. See
 /// [`set_effsafe_cost_models`] to customize the default dynamic cost models.
 pub fn add_effsafe_extract(egraph: &mut EGraph) {
-    egraph.parser.add_command_macro(Arc::new(RegionsAnnotation {
-        head: "constructor",
-    }));
-    egraph
-        .parser
-        .add_command_macro(Arc::new(RegionsAnnotation { head: "datatype" }));
-    egraph
-        .parser
-        .add_command_macro(Arc::new(RegionsAnnotation { head: "datatype*" }));
+    let core = egraph.parser.macros().lookup(Space::Command, "constructor");
+    egraph.parser.macros().register(
+        Space::Command,
+        "constructor",
+        Arc::new(RegionsAnnotation { core }),
+    );
     let commands: [(&str, Arc<dyn UserDefinedCommand>); 2] = [
         ("effsafe-regions", Arc::new(EffsafeRegions)),
         ("print-function", Arc::new(PrintFunction)),
@@ -573,5 +506,9 @@ pub fn add_effsafe_extract(egraph: &mut EGraph) {
     for (name, command) in commands {
         egraph.add_command(name.into(), command).unwrap();
     }
-    egraph.command_macros_mut().register(Arc::new(SetEffectful));
+    egraph.parser.macros().register(
+        Space::Action,
+        set_effectful::SET_EFFECTFUL,
+        Arc::new(SetEffectful),
+    );
 }

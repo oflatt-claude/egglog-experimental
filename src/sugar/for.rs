@@ -1,3 +1,4 @@
+use egglog::macros::{Expansion, Fragment, Macro, MacroContext, Syntax};
 use egglog::{ast::*, util::FreshGen};
 use egglog_ast::generic_ast::RuleEvalMode;
 use egglog_ast::span::Span;
@@ -13,11 +14,14 @@ use egglog_ast::span::Span;
 /// ruleset for one iteration.
 pub struct For;
 
-impl Macro<Vec<Command>> for For {
-    fn name(&self) -> &str {
-        "for"
+impl Macro for For {
+    fn expand(&self, input: &Syntax, cx: &mut MacroContext<'_>) -> Result<Expansion, ParseError> {
+        let (_, args, span) = input.expect_call("macro call")?;
+        Ok(Fragment::Commands(self.parse(args, span, cx.parser())?).into())
     }
+}
 
+impl For {
     fn parse(
         &self,
         args: &[Sexp],

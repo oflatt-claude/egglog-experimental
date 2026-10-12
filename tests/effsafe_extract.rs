@@ -399,21 +399,20 @@ fn set_effectful_accepts_let_bound_variables() {
 }
 
 #[test]
-fn set_effectful_requires_an_explicit_eq_sort() {
-    for action in [
-        "(set-effectful)",
-        "(set-effectful (Arg))",
-        "(set-effectful Expr)",
-        "(set-effectful Expr (Arg) (Arg))",
-        "(set-effectful (Arg) (Arg))",
-        "(set-effectful \"Expr\" (Arg))",
+fn set_effectful_validates_arity_and_optional_sort_annotation() {
+    for (action, message) in [
+        ("(set-effectful)", "usage: (set-effectful [Sort] expr)"),
+        ("(set-effectful Expr)", "Unbound symbol Expr"),
+        (
+            "(set-effectful Expr (Arg) (Arg))",
+            "usage: (set-effectful [Sort] expr)",
+        ),
+        ("(set-effectful (Arg) (Arg))", "expected sort annotation"),
+        ("(set-effectful \"Expr\" (Arg))", "expected sort annotation"),
     ] {
         for command in [action.to_owned(), format!("(rule () ({action}))")] {
             let err = extract_error(&command);
-            assert!(
-                err.contains("usage: (set-effectful <Sort> <expr>)"),
-                "{err}"
-            );
+            assert!(err.contains(message), "{err}");
         }
     }
     for (action, message) in [

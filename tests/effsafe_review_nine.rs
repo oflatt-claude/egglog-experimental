@@ -115,7 +115,7 @@ fn review9_top_level_mark_selects_the_explicit_sort() {
 fn review9_nonseminaive_mark_selects_the_explicit_sort() {
     for (seminaive, mode) in [(true, ":naive"), (false, "")] {
         let mut eg = with_context_overloads();
-        eg.seminaive = seminaive;
+        eg.set_seminaive(seminaive);
         eg.parse_and_run_program(
             None,
             &format!(

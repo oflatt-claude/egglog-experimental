@@ -21,6 +21,7 @@ use crate::{
         Extractor, extract_best_greedy_dag, extract_variants_greedy_dag, split_trailing_extractor,
     },
 };
+use egglog::macros::{Expansion, Fragment, Macro, MacroContext, Space, Syntax};
 use egglog::{
     ArcSort, CommandOutput, EGraph, Enode, RawValues, Read, TermId, UserDefinedCommand, Value,
     ast::*,
@@ -37,10 +38,15 @@ use std::sync::Arc;
 /// [`new_experimental_egraph`](crate::new_experimental_egraph) calls this
 /// automatically.
 pub fn add_set_cost(egraph: &mut EGraph) {
+    egraph.parser.macros().register(
+        Space::Command,
+        "with-dynamic-cost",
+        Arc::new(SetCostDeclarations),
+    );
     egraph
         .parser
-        .add_command_macro(Arc::new(SetCostDeclarations));
-    egraph.parser.add_action_macro(Arc::new(SetCost));
+        .macros()
+        .register(Space::Action, "set-cost", Arc::new(SetCost));
     egraph
         .add_command("extract".into(), Arc::new(CustomExtract))
         .unwrap();
@@ -48,11 +54,14 @@ pub fn add_set_cost(egraph: &mut EGraph) {
 
 struct SetCost;
 
-impl Macro<Vec<Action>> for SetCost {
-    fn name(&self) -> &str {
-        "set-cost"
+impl Macro for SetCost {
+    fn expand(&self, input: &Syntax, cx: &mut MacroContext<'_>) -> Result<Expansion, ParseError> {
+        let (_, args, span) = input.expect_call("macro call")?;
+        Ok(Fragment::Actions(self.parse(args, span, cx.parser())?).into())
     }
+}
 
+impl SetCost {
     fn parse(
         &self,
         args: &[Sexp],
@@ -96,86 +105,74 @@ impl Macro<Vec<Action>> for SetCost {
 
 struct SetCostDeclarations;
 
-impl Macro<Vec<Command>> for SetCostDeclarations {
-    fn name(&self) -> &str {
-        "with-dynamic-cost"
-    }
-
-    fn parse(
-        &self,
-        decls: &[Sexp],
-        span: Span,
-        parser: &mut Parser,
-    ) -> Result<Vec<Command>, ParseError> {
-        // Each argument must expand to a datatype or constructor declaration.
-        // Other macros (`:regions`, say) may expand a declaration into extra
-        // commands; those pass through unchanged.
-        let mut expanded: Vec<Command> = vec![];
-        for decl in decls {
-            let commands = parser.parse_command(decl)?;
-            if !commands.iter().any(|c| {
-                matches!(
-                    c,
-                    Command::Datatype { .. }
-                        | Command::Datatypes { .. }
-                        | Command::Constructor { .. }
-                )
-            }) {
-                return Err(ParseError(
-                    span,
-                    "Expect a datatype declaration".to_string(),
-                ));
-            }
-            expanded.extend(commands);
-        }
-        let mut cost_table_commands = vec![];
-        for decl in expanded.iter() {
-            match decl {
+impl Macro for SetCostDeclarations {
+    fn expand(&self, input: &Syntax, _cx: &mut MacroContext<'_>) -> Result<Expansion, ParseError> {
+        let (_, declarations, _) = input.expect_call("with-dynamic-cost")?;
+        let mapper = Arc::new(|command: Command, _: &mut MacroContext<'_>| {
+            let costs = match &command {
                 Command::Datatype { variants, .. } => {
-                    let commands = generate_cost_table_commands_from_variants(variants);
-                    cost_table_commands.extend(commands);
+                    generate_cost_table_commands_from_variants(variants)
                 }
-                Command::Datatypes { datatypes, .. } => {
-                    let commands =
-                        datatypes.iter().flat_map(
-                            |(_span, _name, subdatatypes)| match subdatatypes {
-                                Subdatatypes::Variants(variants) => {
-                                    generate_cost_table_commands_from_variants(variants)
-                                }
-                                Subdatatypes::NewSort(..) => vec![],
-                            },
-                        );
-                    cost_table_commands.extend(commands);
-                }
+                Command::Datatypes { datatypes, .. } => datatypes
+                    .iter()
+                    .flat_map(|(_, _, datatype)| match datatype {
+                        Subdatatypes::Variants(variants) => {
+                            generate_cost_table_commands_from_variants(variants)
+                        }
+                        Subdatatypes::NewSort(..) => vec![],
+                    })
+                    .collect(),
                 Command::Constructor {
                     name,
                     schema,
                     span,
-                    unextractable,
+                    unextractable: false,
                     ..
-                } => {
-                    if !*unextractable {
-                        let cost_table_name = get_cost_table_name(name);
-                        let mut cost_table_schema = schema.clone();
-                        cost_table_schema.output = "i64".into();
-                        cost_table_commands.push(Command::Function {
-                            span: span.clone(),
-                            name: cost_table_name,
-                            schema: cost_table_schema,
-                            merge: None,
-                            hidden: false,
-                            let_binding: false,
-                            term_constructor: None,
-                            unextractable: false,
-                        });
+                } => vec![Command::Function {
+                    span: span.clone(),
+                    name: get_cost_table_name(name),
+                    schema: Schema::new(schema.input.clone(), "i64".into()),
+                    merge: None,
+                    hidden: false,
+                    let_binding: false,
+                    term_constructor: None,
+                    unextractable: false,
+                }],
+                _ => vec![],
+            };
+            Ok(std::iter::once(command).chain(costs).collect())
+        });
+        let mut result = Vec::new();
+        for declaration in declarations {
+            // Keep each child unevaluated until preceding generated declarations
+            // have been installed. This composes with datatype* and :regions.
+            let declaration = declaration.clone();
+            let mapper = mapper.clone();
+            let wrapper = egglog::macros::MacroBinding::new(
+                Space::Command,
+                Arc::new(move |input: &Syntax, cx: &mut MacroContext<'_>| {
+                    let expanded = cx.expand(Space::Command, input)?;
+                    if let Expansion::Parsed(Fragment::Commands(commands)) = &expanded
+                        && !commands.iter().any(|command| {
+                            matches!(
+                                command,
+                                Command::Datatype { .. }
+                                    | Command::Datatypes { .. }
+                                    | Command::Constructor { .. }
+                            )
+                        })
+                    {
+                        return Err(ParseError(
+                            input.span(),
+                            "expected a datatype or constructor declaration".into(),
+                        ));
                     }
-                }
-                _ => {}
-            }
+                    expanded.map_commands(cx, input.span(), mapper.clone())
+                }),
+            );
+            result.push(wrapper.bind(declaration));
         }
-        let mut commands = expanded;
-        commands.extend(cost_table_commands);
-        Ok(commands)
+        Ok(Expansion::Sequence(result))
     }
 }
 

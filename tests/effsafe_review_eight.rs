@@ -9,7 +9,7 @@ const LANG: &str = r#"
 
 fn run(program: &str, seminaive: bool) {
     let mut eg = new_experimental_egraph();
-    eg.seminaive = seminaive;
+    eg.set_seminaive(seminaive);
     eg.parse_and_run_program(None, &format!("{LANG}\n{program}"))
         .unwrap_or_else(|err| panic!("program failed: {err}"));
 }

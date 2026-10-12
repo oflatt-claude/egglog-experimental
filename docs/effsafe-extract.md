@@ -47,16 +47,18 @@ Three things tell the extractor about the language.
 
 ### `set-effectful`
 
-`(set-effectful Expr e)` marks the e-class of `e` as carrying the state. It is an
+`(set-effectful e)` marks the e-class of `e` as carrying the state. It is an
 action, so rules can use it:
 
 ```lisp
-(rule ((= e (Print v s))) ((set-effectful Expr e)))
+(rule ((= e (Print v s))) ((set-effectful e)))
 ```
 
-The first argument must name an existing eq sort; `e` must have that sort.
-The action also works at top level and on values bound by earlier actions.
-The explicit sort can resolve overloaded expressions.
+The expression must have an equality sort. Its constraints participate in the
+whole rule's inference, including information from later head actions. The action
+also works at top level and on values bound by earlier actions. The optional
+annotation `(set-effectful Expr e)` fixes the sort to `Expr` when inference would
+otherwise be ambiguous.
 
 Effectfulness is a property of e-classes, not constructors: an `If` is
 effectful only when its result carries the state. A container (`Vec`, `Set`,
@@ -205,7 +207,7 @@ statewalks) are checked in debug builds, or in any build when the
 ```lisp
 (extract <expr> :extractor effsafe [:include-subsumed])
 (print-function <constructor> [n] :extractor effsafe [:include-subsumed])
-(set-effectful <Sort> <expr>)
+(set-effectful [<Sort>] <expr>)
 (effsafe-regions <constructor> <position>...)   ; what :regions lowers to
 ```
 

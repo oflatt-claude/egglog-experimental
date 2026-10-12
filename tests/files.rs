@@ -160,6 +160,19 @@ struct ExtractCheck {
 
 fn extract_command_parts(command: &Command) -> Option<ExtractCheck> {
     match command {
+        Command::Unexpanded(syntax) => {
+            let (head, args, span) = syntax.expect_call("command").ok()?;
+            if head != "extract" {
+                return None;
+            }
+            let mut parser = egglog::ast::Parser::default();
+            let args = args
+                .iter()
+                .map(|arg| parser.parse_expr(arg))
+                .collect::<Result<Vec<_>, _>>()
+                .ok()?;
+            extract_command_parts(&Command::UserDefined(span, head, args))
+        }
         Command::UserDefined(_, name, args) if name == "extract" => {
             let use_greedy_dag = matches!(
                 args.last_chunk::<2>(),

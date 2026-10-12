@@ -1,4 +1,5 @@
 use egglog::ast::*;
+use egglog::macros::{Expansion, Fragment, Macro, MacroContext, Syntax};
 use egglog_ast::span::Span;
 
 /// Parse-time macro for assigning several rules or rewrites to one ruleset.
@@ -13,11 +14,14 @@ use egglog_ast::span::Span;
 /// not already name a ruleset.
 pub struct WithRuleset;
 
-impl Macro<Vec<Command>> for WithRuleset {
-    fn name(&self) -> &str {
-        "with-ruleset"
+impl Macro for WithRuleset {
+    fn expand(&self, input: &Syntax, cx: &mut MacroContext<'_>) -> Result<Expansion, ParseError> {
+        let (_, args, span) = input.expect_call("macro call")?;
+        Ok(Fragment::Commands(self.parse(args, span, cx.parser())?).into())
     }
+}
 
+impl WithRuleset {
     fn parse(
         &self,
         args: &[Sexp],
